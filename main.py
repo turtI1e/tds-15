@@ -73,14 +73,15 @@ Revenue = sum of status "paid". Refunds = sum of status "refunded".
 Dates are in Asia/Kolkata timezone.
 
 Return ONLY this JSON:
-{"action":"sum"|"avg"|"count"|"top_product", "metric":"revenue"|"refund",
+{"action":"sum"|"avg"|"count"|"count_customers"|"top_product", "metric":"revenue"|"refund",
  "region":string|null, "product":string|null,
  "start_date":"YYYY-MM-DD"|null, "end_date":"YYYY-MM-DD"|null}
 
 Rules:
 - "top-selling", "best-selling" -> action: "top_product"
 - "average", "mean", "how much is a ... worth" -> action: "avg"
-- "count", "how many orders" -> action: "count"
+- "how many distinct customers", "unique customers" -> action: "count_customers"
+- "count", "how many orders", "how many" -> action: "count"
 - default -> action: "sum"
 - "refunded" -> metric: "refund", else "revenue"
 /no_think
@@ -114,30 +115,32 @@ def compute(filters: dict):
             continue
         filtered.append(o)
 
-    # 1. Count logic
+    # 1. Count distinct customers
+    if action == "count_customers":
+        return len(set(o["customer"] for o in filtered))
+
+    # 2. Standard count of orders
     if action == "count":
         return len(filtered)
 
     if not filtered:
         return "None" if action == "top_product" else 0.0
 
-    # 2. Average logic
+    # 3. Average logic
     if action == "avg":
         total_usd = sum(o["_usd_amount"] for o in filtered)
         return round(total_usd / len(filtered), 2)
 
-    # 3. Top Product logic
+    # 4. Top Product logic
     if action == "top_product":
         product_sums = {}
         for o in filtered:
             p = o["product"]
             product_sums[p] = product_sums.get(p, 0.0) + o["_usd_amount"]
-        
-        # max() returns tuple (key, value). We want the key.
         best_product = max(product_sums.items(), key=lambda x: x[1])
         return best_product[0]
 
-    # 4. Default: Sum logic
+    # 5. Default: Sum logic
     total_usd = sum(o["_usd_amount"] for o in filtered)
     return round(total_usd, 2)
 
@@ -151,7 +154,9 @@ def parse_question_regex(q: str) -> dict:
         action = "top_product"
     elif "average" in ql or "mean" in ql or "avg" in ql or "how much is a" in ql or "worth" in ql:
         action = "avg"
-    elif "count" in ql or "how many orders" in ql:
+    elif "distinct customer" in ql or "unique customer" in ql:
+        action = "count_customers"
+    elif "count" in ql or "how many" in ql:
         action = "count"
 
     # Metric detection

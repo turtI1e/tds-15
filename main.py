@@ -78,7 +78,7 @@ def compute(filters: dict):
     target_status = "paid" if metric == "revenue" else "refunded"
     region = filters.get("region")
     product = filters.get("product")
-    customer = filters.get("customer")  # NEW: Customer filter
+    customer = filters.get("customer")
     start = filters.get("start_date")
     end = filters.get("end_date")
 
@@ -90,7 +90,7 @@ def compute(filters: dict):
             continue
         if product and o["product"].lower() != product.lower():
             continue
-        if customer and o["customer"].lower() != customer.lower(): # NEW
+        if customer and o["customer"].lower() != customer.lower():
             continue
         if start and o["_ist_date"] < start:
             continue
@@ -103,14 +103,10 @@ def compute(filters: dict):
 
     if action == "count_customers":
         return len(set(o["customer"] for o in filtered))
-
     if action == "count":
         return len(filtered)
-
     if action == "avg":
-        total_usd = sum(o["_usd_amount"] for o in filtered)
-        return round(total_usd / len(filtered), 2)
-
+        return round(sum(o["_usd_amount"] for o in filtered) / len(filtered), 2)
     if action == "top_product":
         product_sums = {}
         for o in filtered:
@@ -118,42 +114,54 @@ def compute(filters: dict):
             product_sums[p] = product_sums.get(p, 0.0) + o["_usd_amount"]
         return max(product_sums.items(), key=lambda x: x[1])[0]
 
-    total_usd = sum(o["_usd_amount"] for o in filtered)
-    return round(total_usd, 2)
+    return round(sum(o["_usd_amount"] for o in filtered), 2)
 
 
 def parse_question_regex(q: str) -> dict:
     ql = q.lower()
 
-    # 1. ACTION DETECTION (Using Regex word boundaries to prevent "account" -> "count")
+    # 1. ACTION DETECTION
     action = "sum"
-    if re.search(r'\b(top|best|highest|most|maximum)[- ]?(selling|product|revenue|sold|money)\b', ql) or "which product" in ql:
-        action = "top_product"
-    elif re.search(r'\b(average|avg|mean|typical)\b', ql) or "how much is a" in ql or "worth" in ql:
+    
+    # Top Product
+    if any(w in ql for w in ["top", "best", "highest", "most", "maximum", "which product", "what product"]) and \
+       not any(w in ql for w in ["average", "mean", "count", "how many"]):
+        if any(w in ql for w in ["product", "selling", "sold", "item", "revenue", "money", "earner"]):
+            action = "top_product"
+    
+    # Average
+    if action == "sum" and any(w in ql for w in ["average", "avg", "mean", "typical"]):
         action = "avg"
-    elif re.search(r'\b(distinct|unique|different)\b', ql) or re.search(r'\bcustomers\b', ql):
-        action = "count_customers"
-    elif re.search(r'\b(count|number|how many|total)\b', ql):
-        action = "count"
+        
+    # Count Customers
+    if action == "sum" and any(w in ql for w in ["customer", "buyer", "user"]):
+        if any(w in ql for w in ["how many", "count", "number", "distinct", "unique", "different"]):
+            action = "count_customers"
+            
+    # Count Orders
+    if action == "sum" and any(w in ql for w in ["how many", "count", "number"]):
+        # Make sure they aren't asking for a monetary value
+        if not any(w in ql for w in ["revenue", "sales", "usd", "amount", "dollar", "worth", "money"]):
+            action = "count"
 
     # 2. METRIC DETECTION
-    metric = "refund" if any(re.search(rf'\b{w}\b', ql) for w in REFUND_WORDS) else "revenue"
+    metric = "refund" if any(w in ql for w in REFUND_WORDS) else "revenue"
 
     # 3. REGION DETECTION
     region = None
     for r in sorted(REGIONS, key=len, reverse=True):
-        if re.search(rf'\b{r.lower()}\b', ql):
+        if r.lower() in ql:
             region = r
             break
 
     # 4. PRODUCT DETECTION
     product = None
     for p in sorted(PRODUCTS, key=len, reverse=True):
-        if re.search(rf'\b{p.lower()}\b', ql):
+        if p.lower() in ql:
             product = p
             break
 
-    # 5. CUSTOMER DETECTION (Look for C followed by digits, e.g., C1131)
+    # 5. CUSTOMER DETECTION
     customer = None
     cm = re.search(r'\b(c\d+)\b', ql)
     if cm:
@@ -163,36 +171,41 @@ def parse_question_regex(q: str) -> dict:
     months = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
     start = end = None
     
-    # Explicit Month + Year (e.g., "March 2026")
+    # Explicit Month + Year
     m = re.search(r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})", ql)
     if m:
         mo, yr = months[m.group(1)], int(m.group(2))
         start = f"{yr}-{mo:02d}-01"
         end = f"{yr}-{mo:02d}-{calendar.monthrange(yr, mo)[1]}"
-
-    # Quarter (e.g., "Q1 2026")
-    qm = re.search(r"q([1-4])\s+(\d{4})", ql)
-    if qm:
-        qtr, yr = int(qm.group(1)), int(qm.group(2))
-        first = (qtr - 1) * 3 + 1
-        last = first + 2
-        start = f"{yr}-{first:02d}-01"
-        end = f"{yr}-{last:02d}-{calendar.monthrange(yr, last)[1]}"
-
-    # Just a Year (e.g., "in 2026") -> Only trigger if start/end are still None
-    if not start and not end:
-        ym = re.search(r'\b(202\d)\b', ql)
-        if ym:
-            yr = ym.group(1)
-            start = f"{yr}-01-01"
-            end = f"{yr}-12-31"
+    else:
+        # Quarter
+        qm = re.search(r"q([1-4])\s+(\d{4})", ql)
+        if qm:
+            qtr, yr = int(qm.group(1)), int(qm.group(2))
+            first = (qtr - 1) * 3 + 1
+            last = first + 2
+            start = f"{yr}-{first:02d}-01"
+            end = f"{yr}-{last:02d}-{calendar.monthrange(yr, last)[1]}"
+        else:
+            # Just a Year
+            ym = re.search(r'\b(202\d)\b', ql)
+            if ym:
+                yr = ym.group(1)
+                start = f"{yr}-01-01"
+                end = f"{yr}-12-31"
+            else:
+                # Just a Month (fallback to 2026 based on data)
+                for mo_name, mo_num in months.items():
+                    if mo_name in ql:
+                        start = f"2026-{mo_num:02d}-01"
+                        end = f"2026-{mo_num:02d}-{calendar.monthrange(2026, mo_num)[1]}"
+                        break
 
     return {
         "action": action, "metric": metric, "region": region, 
         "product": product, "customer": customer,
         "start_date": start, "end_date": end
     }
-
 
 @app.post("/answer")
 async def answer(q: Question):

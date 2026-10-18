@@ -17,14 +17,11 @@ app = FastAPI()
 ORDERS = []
 RATES = {}
 
-# Real names from your /orders data — see check_data.py output.
 REGIONS = ["Central", "East", "North", "South", "West"]
 PRODUCTS = [
     "Air Fryer", "Blender", "Grinder", "Juicer",
     "Kettle", "Mixer", "Rice Cooker", "Toaster",
 ]
-
-# Refund synonyms so paraphrases like "how much money was returned" work.
 REFUND_WORDS = ["refund", "returned", "money back", "reversal", "reversed"]
 
 USE_OLLAMA = os.getenv("USE_OLLAMA", "0") == "1"
@@ -54,7 +51,6 @@ async def load_data():
             raw.extend(data["orders"])
             url = data.get("next")
 
-        # Deduplicate: keep the row with the latest updated_at per order id.
         latest = {}
         for o in raw:
             oid = o["id"]
@@ -62,7 +58,6 @@ async def load_data():
                 latest[oid] = o
         ORDERS = list(latest.values())
 
-        # Pre-compute USD amount and IST date once per order.
         for o in ORDERS:
             rate = RATES.get(o["currency"], 1.0)
             o["_usd_amount"] = o["amount"] * rate
@@ -78,8 +73,16 @@ Revenue = sum of status "paid". Refunds = sum of status "refunded".
 Dates are in Asia/Kolkata timezone.
 
 Return ONLY this JSON:
-{"metric":"revenue"|"refund","region":string|null,"product":string|null,
- "start_date":"YYYY-MM-DD"|null,"end_date":"YYYY-MM-DD"|null}
+{"action":"sum"|"avg"|"count"|"top_product", "metric":"revenue"|"refund",
+ "region":string|null, "product":string|null,
+ "start_date":"YYYY-MM-DD"|null, "end_date":"YYYY-MM-DD"|null}
+
+Rules:
+- "top-selling", "best-selling" -> action: "top_product"
+- "average", "mean", "how much is a ... worth" -> action: "avg"
+- "count", "how many orders" -> action: "count"
+- default -> action: "sum"
+- "refunded" -> metric: "refund", else "revenue"
 /no_think
 """
 
@@ -88,7 +91,8 @@ class Question(BaseModel):
     question: str
 
 
-def compute(filters: dict) -> float:
+def compute(filters: dict):
+    action = filters.get("action", "sum")
     metric = filters.get("metric", "revenue")
     target_status = "paid" if metric == "revenue" else "refunded"
     region = filters.get("region")
@@ -96,7 +100,7 @@ def compute(filters: dict) -> float:
     start = filters.get("start_date")
     end = filters.get("end_date")
 
-    total = 0.0
+    filtered = []
     for o in ORDERS:
         if o["status"] != target_status:
             continue
@@ -108,32 +112,66 @@ def compute(filters: dict) -> float:
             continue
         if end and o["_ist_date"] > end:
             continue
-        total += o["_usd_amount"]
-    return round(total, 2)
+        filtered.append(o)
+
+    # 1. Count logic
+    if action == "count":
+        return len(filtered)
+
+    if not filtered:
+        return "None" if action == "top_product" else 0.0
+
+    # 2. Average logic
+    if action == "avg":
+        total_usd = sum(o["_usd_amount"] for o in filtered)
+        return round(total_usd / len(filtered), 2)
+
+    # 3. Top Product logic
+    if action == "top_product":
+        product_sums = {}
+        for o in filtered:
+            p = o["product"]
+            product_sums[p] = product_sums.get(p, 0.0) + o["_usd_amount"]
+        
+        # max() returns tuple (key, value). We want the key.
+        best_product = max(product_sums.items(), key=lambda x: x[1])
+        return best_product[0]
+
+    # 4. Default: Sum logic
+    total_usd = sum(o["_usd_amount"] for o in filtered)
+    return round(total_usd, 2)
 
 
 def parse_question_regex(q: str) -> dict:
     ql = q.lower()
 
-    # Metric: refund if any synonym is present, otherwise revenue.
+    # Action detection
+    action = "sum"
+    if "top-selling" in ql or "top selling" in ql or "best-selling" in ql:
+        action = "top_product"
+    elif "average" in ql or "mean" in ql or "avg" in ql or "how much is a" in ql or "worth" in ql:
+        action = "avg"
+    elif "count" in ql or "how many orders" in ql:
+        action = "count"
+
+    # Metric detection
     metric = "refund" if any(w in ql for w in REFUND_WORDS) else "revenue"
 
-    # Region: longest-name-first so multi-word names win.
+    # Region detection
     region = None
     for r in sorted(REGIONS, key=len, reverse=True):
         if r.lower() in ql:
             region = r
             break
 
-    # Product: longest-name-first so "Rice Cooker" is matched before any
-    # accidental substring, and "Air Fryer" is preserved as two words.
+    # Product detection
     product = None
     for p in sorted(PRODUCTS, key=len, reverse=True):
         if p.lower() in ql:
             product = p
             break
 
-    # Month + Year
+    # Date detection
     months = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
     start = end = None
     m = re.search(
@@ -146,7 +184,6 @@ def parse_question_regex(q: str) -> dict:
         start = f"{yr}-{mo:02d}-01"
         end = f"{yr}-{mo:02d}-{calendar.monthrange(yr, mo)[1]}"
 
-    # Quarter
     qm = re.search(r"q([1-4])\s+(\d{4})", ql)
     if qm:
         qtr, yr = int(qm.group(1)), int(qm.group(2))
@@ -155,12 +192,11 @@ def parse_question_regex(q: str) -> dict:
         start = f"{yr}-{first:02d}-01"
         end = f"{yr}-{last:02d}-{calendar.monthrange(yr, last)[1]}"
 
-    return {"metric": metric, "region": region, "product": product,
+    return {"action": action, "metric": metric, "region": region, "product": product,
             "start_date": start, "end_date": end}
 
 
 async def parse_with_llm(question: str, hard_timeout: float = 5.0):
-    """Call Ollama with a true hard timeout. Returns None on any failure."""
     def _sync_call():
         return client.chat.completions.create(
             model=MODEL,
@@ -175,8 +211,8 @@ async def parse_with_llm(question: str, hard_timeout: float = 5.0):
     try:
         resp = await asyncio.wait_for(asyncio.to_thread(_sync_call), timeout=hard_timeout)
         return json.loads(resp.choices[0].message.content)
-    except (asyncio.TimeoutError, Exception) as exc:
-        print(f"LLM unavailable/timed out ({type(exc).__name__}: {exc}); using regex", flush=True)
+    except Exception as exc:
+        print(f"LLM unavailable ({exc}); using regex", flush=True)
         return None
 
 

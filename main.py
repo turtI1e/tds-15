@@ -144,13 +144,13 @@ def compute(filters: dict):
     total_usd = sum(o["_usd_amount"] for o in filtered)
     return round(total_usd, 2)
 
-
 def parse_question_regex(q: str) -> dict:
     ql = q.lower()
 
     # Action detection
     action = "sum"
-    if "top-selling" in ql or "top selling" in ql or "best-selling" in ql:
+    # Catch variations like "which product earned the most" or "highest revenue product"
+    if any(w in ql for w in ["top-selling", "top selling", "best-selling", "top product", "which product", "highest revenue", "most revenue"]):
         action = "top_product"
     elif "average" in ql or "mean" in ql or "avg" in ql or "how much is a" in ql or "worth" in ql:
         action = "avg"
@@ -199,7 +199,6 @@ def parse_question_regex(q: str) -> dict:
 
     return {"action": action, "metric": metric, "region": region, "product": product,
             "start_date": start, "end_date": end}
-
 
 async def parse_with_llm(question: str, hard_timeout: float = 5.0):
     def _sync_call():
